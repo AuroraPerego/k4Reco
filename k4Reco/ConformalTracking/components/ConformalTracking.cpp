@@ -369,6 +369,7 @@ edm4hep::TrackCollection ConformalTracking::operator()(
   auto outputTrackCollection = edm4hep::TrackCollection();
   auto debugHitCollection = edm4hep::TrackerHitPlaneCollection();
   debugHitCollection.setSubsetCollection();
+  std::cout << "running conformal tracking\n";
 
   // Make the collection of conformal hits that will be used, with a link back to
   // the corresponding tracker hit.
@@ -1874,13 +1875,20 @@ bool ConformalTracking::toBeUpdated(UniqueCellularTracks const& cellularTracks) 
   return false;
 }
 
-// New test at creating cellular tracks. In this variant, don't worry about clones etc, give all possible routes back to
-// the seed cell. Then cut on number of clusters on each track, and pass back (good tracks to then be decided based on
-// best chi2
+// New test at creating cellular tracks. In this variant, don't worry about clones etc, give all
+// possible routes back to the seed cell. Then cut on number of clusters on each track, and pass
+// back good tracks to then be decided based on best chi2.
+//
+// Safety notes vs the original implementation:
+//  - The two unbounded while-loops are replaced by loops with explicit, small upper bounds
+//    (m_tooManyTracks acts as the track-count bound; a per-track length bound and a cycle guard
+//    protect the "simple extension" walk).
+//  - Branch copies (`cellularTrack` copy) are unavoidable in principle -- each branch needs its
+//    own independent history -- but we avoid *extra* copies: the original track is extended
+//    in place for branch 0, and only branches 1..N-1 are cloned.
 UniqueCellularTracks ConformalTracking::createTracksNew(const SCell& seedCell) const {
-  debug() << "***** createTracksNew" << endmsg;
+  debug() << "createTracksNew" << endmsg;
 
-  // Final container to be returned
   UniqueCellularTracks cellularTracks;
 
   // Make the first cellular track using the seed cell
@@ -1890,89 +1898,135 @@ UniqueCellularTracks ConformalTracking::createTracksNew(const SCell& seedCell) c
 
   debug() << "Follow all paths from higher weighted cells back to the seed cell" << endmsg;
   // Now start to follow all paths back from this seed cell
-  // While there are still tracks that are not finished (last cell weight 0), keep following their path
+  // While there are still tracks that are not finished (last cell has parents left),
+  // keep following their path
   while (toBeUpdated(cellularTracks)) {
-    //   debug()<<"== Updating "<<cellularTracks.size()<<" tracks"<<std::endl;
     // Loop over all (currently existing) tracks
-    size_t nTracks = cellularTracks.size();
+    const size_t nTracks = cellularTracks.size();
 
     debug() << "Going to create " << nTracks << " tracks" << endmsg;
     if (nTracks > 10000) {
-      warning() << "WARNING: Going to create " << nTracks << " tracks " << endmsg;
+      warning() << "WARNING: Going to create " << nTracks << " tracks" << endmsg;
     }
     if (nTracks > m_tooManyTracks) {
       error() << "Too many tracks (" << nTracks << " > " << m_tooManyTracks
-              << " are going to be created, tightening parameters" << endmsg;
+              << ") are going to be created, tightening parameters" << endmsg;
       throw std::runtime_error("Too many tracks");
     }
+
+    // New tracks created by branching in this pass are collected separately and
+    // appended once at the end, so we never iterate over tracks created within
+    // this same pass (equivalent behaviour to capturing nTracks up front, but explicit).
+    UniqueCellularTracks newTracks; // NOTE old behavoiur should be ok as well
+
     for (size_t itTrack = 0; itTrack < nTracks; itTrack++) {
+      auto& track = cellularTracks[itTrack];
+
       // If the track is finished, do nothing
-      //      if(cellularTracks[itTrack].back()->getWeight() == 0) continue;
-      if (cellularTracks[itTrack]->back()->getFrom().size() == 0) {
-        debug() << "- Cellular track " << itTrack << " is finished " << endmsg;
-        //       debug()<<"-- Track "<<itTrack<<" is finished"<<std::endl;
+      if (track->back()->getFrom().empty()) {
+        debug() << "- Cellular track " << itTrack << " is finished" << endmsg;
         continue;
       }
 
-      // While there is only one path leading from this cell, follow that path
-      SCell cell = cellularTracks[itTrack]->back();
-      //     debug()<<"-- Track "<<itTrack<<" has "<<(*(cell->getFrom())).size()<<" cells attached to the end of
-      //     it"<<std::endl;
-      //      while(cell->getWeight() > 0 && (*(cell->getFrom())).size() == 1){
+      // --- Bounded replacement for: while (cell->getFrom().size() == 1) { ... } ---
+      // Follow single-parent extensions. Guard against (a) pathologically long/looping
+      // chains and (b) revisiting the same cell (which would indicate a cycle in the
+      // cell graph and would otherwise walk forever).
+      SCell cell = track->back();
+      std::vector<const Cell*> visited;
+      visited.push_back(cell.get());
+
       while (cell->getFrom().size() == 1) {
-        debug() << "- Cellular track " << itTrack << " is a simple extension" << endmsg;
-        //       debug()<<"- simple extension"<<std::endl;
-        // Get the cell that it attaches to
+        if (track->size() > m_tooManyTracks) {
+          // A single track growing this long is itself a sign something is wrong;
+          // fail the same way as the "too many tracks" case rather than looping forever.
+          error() << "Cellular track " << itTrack
+                  << " exceeded maximum length while following a simple extension" << endmsg;
+          throw std::runtime_error("Cellular track too long");
+        }
+
         auto parentCell = SCell(cell->getFrom()[0]);
+        if (!parentCell) {
+          // Expired weak_ptr: nothing more to follow safely.
+          break;
+        }
+
+        if (std::find(visited.begin(), visited.end(), parentCell.get()) != visited.end()) {
+          warning() << "Cycle detected while following cellular track " << itTrack
+                    << ", stopping this extension" << endmsg;
+          break;
+        }
+        visited.push_back(parentCell.get());
+
+        debug() << "- Cellular track " << itTrack << " is a simple extension" << endmsg;
         debug() << "- Added parent cell A ([x,y] = [" << parentCell->getStart()->getX() << ", "
                 << parentCell->getStart()->getY() << "]) - B ([x,y] = [" << cell->getEnd()->getX() << ", "
                 << cell->getEnd()->getY() << "])" << endmsg;
-        // Attach it to the track and continue
-        cellularTracks[itTrack]->push_back(parentCell);
-        cell = parentCell;
+
+        track->push_back(parentCell);
+        cell = std::move(parentCell);
       }
 
       // If the track is finished, do nothing
-      //      if(cellularTracks[itTrack].back()->getWeight() == 0) continue;
-      if (cellularTracks[itTrack]->back()->getFrom().size() == 0)
+      if (track->back()->getFrom().empty()) {
         continue;
-
-      // If the weight is != 0 and there is more than one path to follow, branch the track (create a new one for each
-      // path)
-      debug() << "- Cellular track " << itTrack << " has more than one extension" << endmsg;
-
-      //     debug()<<"- making "<<nBranches<<" branches"<<std::endl;
-
-      // For each additional branch make a new track
-      for (size_t itBranch = 1; itBranch < cell->getFrom().size(); itBranch++) {
-        debug() << "-- Cellular track " << itTrack << ", extension " << itBranch << endmsg;
-        auto branchedTrack = std::unique_ptr<cellularTrack>(new cellularTrack(*(cellularTracks[itTrack].get())));
-        auto branchedParentCell = SCell(cell->getFrom()[itBranch]);
-        debug() << "-- Added branched parent cell A ([x,y] = [" << branchedParentCell->getStart()->getX() << ", "
-                << branchedParentCell->getStart()->getY() << "]) - B ([x,y] = [" << cell->getEnd()->getX() << ", "
-                << cell->getEnd()->getY() << "])" << endmsg;
-        branchedTrack->push_back(std::move(branchedParentCell));
-        cellularTracks.push_back(std::move(branchedTrack));
       }
 
-      // Keep the existing track for the first branch
-      cellularTracks[itTrack]->push_back(SCell(cell->getFrom()[0]));
+      // --- Branching: end-cell has >= 1 parent left, cell is already track->back() ---
+      cell = track->back();
+      const auto& fromCellsWeak = cell->getFrom();
+
+      // Resolve weak_ptrs once, keep only those that are still alive
+      std::vector<SCell> fromCells;
+      fromCells.reserve(fromCellsWeak.size());
+      for (const auto& w : fromCellsWeak) {
+        if (auto s = SCell(w)) fromCells.push_back(std::move(s));
+      }
+      if (fromCells.empty()) continue;
+
+      // Weight-based pruning: only follow parents whose weight is the maximum among the candidates.
+      const int maxParentWeight =
+          std::max_element(fromCells.begin(), fromCells.end(),
+                           [](const SCell& a, const SCell& b) { return a->getWeight() < b->getWeight(); })
+              ->get()
+              ->getWeight();
+
+      std::vector<SCell> bestParents;
+      for (auto& p : fromCells) {
+        if (p->getWeight() == maxParentWeight) bestParents.push_back(std::move(p));
+      }
+
+      debug() << "- Cellular track " << itTrack << " has " << bestParents.size()
+              << " maximal-weight extension(s) out of " << fromCells.size() << " candidates" << endmsg;
+
+      // For each additional branch, make a new track (a genuine copy is required here:
+      // each branch needs an independent history from this point on).
+      for (size_t itBranch = 1; itBranch < bestParents.size(); itBranch++) {
+        if (nTracks + newTracks.size() >= m_tooManyTracks) {
+          error() << "Too many tracks would be created while branching cellular track " << itTrack
+                  << ", tightening parameters" << endmsg;
+          throw std::runtime_error("Too many tracks");
+        }
+
+        debug() << "-- Cellular track " << itTrack << ", extension " << itBranch << endmsg;
+
+        auto branchedTrack = std::make_unique<cellularTrack>(*track);
+        branchedTrack->push_back(bestParents[itBranch]);
+        newTracks.push_back(std::move(branchedTrack));
+      }
+
+      track->push_back(bestParents[0]);
+    }
+
+    // Append all tracks created by branching in this pass
+    if (!newTracks.empty()) {
+      cellularTracks.insert(cellularTracks.end(), std::make_move_iterator(newTracks.begin()),
+                            std::make_move_iterator(newTracks.end()));
     }
   }
 
-  debug() << "Number of finalcellularTracks = " << cellularTracks.size() << endmsg;
-  // if (streamlog_level(DEBUG8)) {
-  //   for (auto& cellTrack : finalcellularTracks) {
-  //      debug() << "- Finalcelltrack is made of " << cellTrack->size() << " cells " << endmsg;
-  //     for (unsigned int finalcell = 0; finalcell < cellTrack->size(); finalcell++) {
-  //        debug() << "-- Cell A ([x,y] = [" << (*cellTrack)[finalcell]->getStart()->getX() << ", "
-  //                             << (*cellTrack)[finalcell]->getStart()->getY() << "]) - B ([x,y] = ["
-  //                             << (*cellTrack)[finalcell]->getEnd()->getX() << ", "
-  //                             << (*cellTrack)[finalcell]->getEnd()->getY() << "])" << endmsg;
-  //     }
-  //   }
-  // }
-  debug() << "createTracksNew *****" << endmsg;
+  debug() << "Number of final cellularTracks " << cellularTracks.size() << endmsg;
+  debug() << "createTracksNew" << endmsg;
 
   return cellularTracks;
 }
