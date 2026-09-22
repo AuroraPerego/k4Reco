@@ -1044,8 +1044,9 @@ UniqueKDTracks ConformalTracking::getFittedTracks(UniqueCellularTracks& candidat
     // Loop over each hit (starting at the back, since we will use the 'erase' function to get rid of them)
     // and see if removing it improves the chi2/ndof
     int removed = 0;
-    if (chi2ndofTOT > parameters.m_chi2cut &&
-        chi2ndofTOT < parameters.m_chi2cut) { // CHANGE ME?? Upper limit to get rid of really terrible tracks (temp
+    std::cout << "chi2 = " << track->chi2ndof() << " " << track->chi2ndofZS() << "\n";
+    if (chi2ndofTOT > 10) { //parameters.m_chi2cut &&
+      //  chi2ndofTOT < parameters.m_chi2cut) { // CHANGE ME?? Upper limit to get rid of really terrible tracks (temp
                                               // lower changed from 0 to parameters.m_chi2cut)
 
       debug() << "- Track " << candidateTrack.get() << ": chi2ndofTOT > chi2cut. Try to fit without point" << endmsg;
@@ -1060,10 +1061,11 @@ UniqueKDTracks ConformalTracking::getFittedTracks(UniqueCellularTracks& candidat
 
         // If the chi2/ndof is significantly better, remove the point permanently CHANGE ME??
         //        if( (chi2ndofTOT - newChi2ndofTOT) > 0 && (chi2ndofTOT - newChi2ndofTOT) > 1. ){
-        if ((newChi2ndofTOT - chi2ndofTOT) < chi2ndofTOT) {
+        if (newChi2ndofTOT < 10) {
           track->remove(point);
           removed++;
           chi2ndofTOT = newChi2ndofTOT;
+          std::cout << "new chi2 " << chi2ndofTOT << "\n";
         }
       }
     }
